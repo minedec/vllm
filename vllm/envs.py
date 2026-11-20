@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MQA_TOPK: bool = True
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
+    VLLM_QSA_ATTENTION_BACKEND: Literal["auto", "prims_ts"] = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1168,6 +1169,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 disables decode chunking.
     "VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB", "2048")
+    ),
+    # Qwen4Exp QSA reader for NVFP4 KV cache. Auto uses the normal QSA dispatch.
+    "VLLM_QSA_ATTENTION_BACKEND": env_with_choices(
+        "VLLM_QSA_ATTENTION_BACKEND", "auto", ["auto", "prims_ts"]
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

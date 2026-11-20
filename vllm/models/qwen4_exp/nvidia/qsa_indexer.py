@@ -143,6 +143,7 @@ class QSAIndexer(nn.Module):
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA indexer cache.
         self.skip_topk = False
+        self.preserve_selection = layer_id >= config.num_hidden_layers
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -233,14 +234,18 @@ class QSAIndexer(nn.Module):
         attn: "Qwen4ExpQSAAttention",
         qkv: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        return_blocks: bool = False,
+    ) -> tuple[
+        torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor | None
+    ]:
         """Update indexer caches and select token indices from pre-projected Q/K.
 
         Returns the packed buffer of shape [num_tokens, output_width + 1]:
         the leading `output_width` columns are `-1`-padded
         request-relative token indices, and the trailing column is the row's
         valid-entry count (the attention kernel's loop bound, never a token
-        index).
+        index). When `return_blocks` is set, return compressed block IDs and
+        their logical positions as the first and third elements.
 
         With `attn.use_fused_qsa_prepare`, the same launch also writes
         `attn`'s K/V into `attn.kv_cache` at `slot_mapping` and prepares
@@ -251,7 +256,7 @@ class QSAIndexer(nn.Module):
         if metadata is None:
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
-                return out, None
+                return out, None, None
             result = torch.full(
                 (projected_qk.shape[0], self.packed_output_width),
                 -1,
@@ -262,8 +267,8 @@ class QSAIndexer(nn.Module):
             result[:, -1] = 0
             if out is not None:
                 out.copy_(result)
-                return out, None
-            return result, None
+                return out, None, None
+            return result, None, None
 
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
         from .ops.qsa_indexer import (
@@ -394,7 +399,14 @@ class QSAIndexer(nn.Module):
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
-            return out, main_outputs
+            if return_blocks:
+                block_topk = self.token_topk // self.compress_ratio
+                return (
+                    out[:, :block_topk],
+                    main_outputs,
+                    out[:, block_topk].contiguous(),
+                )
+            return out, main_outputs, None
 
         if out is None:
             out = torch.empty(
@@ -451,15 +463,23 @@ class QSAIndexer(nn.Module):
                 compressed_metadata.max_seq_len,
                 self.topk_backend,
             )
+        selection_positions = compressed_metadata.logical_positions[:num_tokens]
+        if return_blocks:
+            if self.preserve_selection:
+                # MTP compacts entire rows between steps, preserving the
+                # selected blocks and the causal position for their tail.
+                out[:, : block_indices.shape[1]].copy_(block_indices)
+                out[:, block_indices.shape[1]].copy_(selection_positions)
+            return block_indices, main_outputs, selection_positions
         expand_qsa_block_indices(
             block_indices,
-            compressed_metadata.logical_positions[:num_tokens],
+            selection_positions,
             visible_blocks,
             self.compress_ratio,
             self.token_topk,
             out,
         )
-        return out, main_outputs
+        return out, main_outputs, None
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rope"]

@@ -1,5 +1,34 @@
 # Quantized KV Cache
 
+## NVFP4 KV Cache for Qwen4Exp QSA
+
+Use `--kv-cache-dtype nvfp4` to store the Qwen4Exp QSA full-attention K/V cache
+in NVFP4 with 256-dimensional heads. After QK normalization and RoPE, the
+cache packs two E2M1 values per byte and stores one E4M3 scale per 16 values,
+with no additional per-tensor scale. Both FlashInfer readers decode selected
+K/V rows to BF16 for the attention computation. Use a FlashInfer build that
+includes the reader's kernel sources, such as a source install.
+
+The indexer cache retains its own `--attention-config.indexer_kv_dtype`
+setting. The following command pairs NVFP4 K/V with an FP8 indexer.
+
+```bash
+vllm serve Qwen/Qwen3.8-Flash-Next \
+  --kv-cache-dtype nvfp4 \
+  --attention-config.indexer_kv_dtype fp8
+```
+
+`VLLM_QSA_ATTENTION_BACKEND=auto` is the default. FlashInfer automatically
+selects CAKE on SM100, SM103, SM107, and SM120 with up to 16 query heads per
+KV head. FlashInfer builds that gate experimental automatic backend selection need
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`.
+
+On SM100, SM103, and SM107, set `VLLM_QSA_ATTENTION_BACKEND=prims_ts` to use
+FlashInfer PrimTS for both prefill and decode. PrimTS reads the same packed
+QAT NVFP4 cache and expands tiles to BF16 inside the kernel. Use CUDA 13.2 or
+newer and a FlashInfer build with the
+[NVFP4 QToken group policy](https://github.com/flashinfer-ai/flashinfer/pull/9659).
+
 ## FP8 KV Cache Overview
 
 Efficient memory usage is crucial for working with large language models. Quantizing the KV (Key-Value) cache to FP8 format can significantly reduce its memory footprint. This optimization enables you to store more tokens in memory, leading to improved throughput and support for longer context windows.

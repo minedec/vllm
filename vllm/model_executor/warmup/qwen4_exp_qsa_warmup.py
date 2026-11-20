@@ -89,9 +89,10 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
             prefill_width,
         )
 
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        warmup_qsa_sparse_paged_attention,
-    )
+    if owner.impl.is_nvfp4:
+        return
+
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import warmup_qsa_sparse_paged_attention
 
     kv_cache = owner.kv_cache
     assert kv_cache.numel()

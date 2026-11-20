@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernels for Qwen4Exp QSA sparse attention and cache updates."""
+"""Qwen4Exp QSA sparse attention and cache updates."""
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
+from inspect import signature
+from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
@@ -15,6 +20,15 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.models.qwen4_exp.nvidia.ops import qsa_fp8
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
+
+if TYPE_CHECKING:
+    from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+        QTokenKvBlockSparsePagedTSWrapper,
+    )
+
+logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -57,6 +71,85 @@ def _maybe_dequant(tile):
         return tile.to(tl.float16)
     else:
         return tile
+
+
+@triton.jit
+def _store_nvfp4_kernel(
+    cache,
+    slots,
+    rows,
+    stride_block,
+    stride_token,
+    stride_head,
+    stride_row,
+    stride_row_head,
+    stride_row_dim,
+    num_blocks,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    slot = tl.load(slots + row).to(tl.int64)
+    page = slot // PAGE_SIZE
+    if slot < 0 or page >= num_blocks:
+        return
+
+    dims = tl.arange(0, HEAD_DIM)
+    x = tl.load(
+        rows
+        + row.to(tl.int64) * stride_row
+        + head * stride_row_head
+        + dims * stride_row_dim
+    ).to(tl.float32)
+    groups = tl.reshape(x, (HEAD_DIM // 16, 16))
+    abs_x = tl.abs(groups)
+    amax = tl.max(tl.where(abs_x == abs_x, abs_x, float("inf")), axis=1)
+    scale = tl.clamp(amax * (1.0 / 6.0), 2.0**-9, 448.0).to(tl.float8e4nv)
+    scale_bytes = tl.where(
+        amax < float("inf"), scale.to(tl.uint8, bitcast=True), 0x7F
+    ).to(tl.uint8)
+    # Scaled midpoints and alternating comparisons give round-to-nearest-even
+    # without division rounding a value to the wrong side of a tie.
+    s = scale.to(tl.float32)[:, None]
+    code = (
+        (abs_x > 0.25 * s).to(tl.int32)
+        + (abs_x >= 0.75 * s).to(tl.int32)
+        + (abs_x > 1.25 * s).to(tl.int32)
+        + (abs_x >= 1.75 * s).to(tl.int32)
+        + (abs_x > 2.5 * s).to(tl.int32)
+        + (abs_x >= 3.5 * s).to(tl.int32)
+        + (abs_x > 5.0 * s).to(tl.int32)
+    )
+    sign = (groups.to(tl.int32, bitcast=True) >> 31) & 1
+    lo, hi = tl.split(tl.reshape(code | (sign << 3), (HEAD_DIM // 2, 2)))
+    dst = (
+        cache
+        + page * stride_block
+        + (slot % PAGE_SIZE) * stride_token
+        + head * stride_head
+    )
+    tl.store(dst + tl.arange(0, HEAD_DIM // 2), (lo | (hi << 4)).to(tl.uint8))
+    tl.store(dst + HEAD_DIM // 2 + tl.arange(0, HEAD_DIM // 16), scale_bytes)
+
+
+def qsa_store_nvfp4_cache(
+    cache: torch.Tensor, slot_mapping: torch.Tensor, rows: torch.Tensor
+) -> None:
+    """Write post-RoPE K or V as packed E2M1 plus one E4M3 scale per 16 values."""
+    if not slot_mapping.numel():
+        return
+    _store_nvfp4_kernel[(slot_mapping.numel(), rows.shape[1])](
+        cache,
+        slot_mapping,
+        rows,
+        *cache.stride()[:3],
+        *rows.stride(),
+        cache.shape[0],
+        PAGE_SIZE=cache.shape[1],
+        HEAD_DIM=rows.shape[2],
+        num_warps=4,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -635,6 +728,25 @@ def _select_config(
     return BLOCK_N, num_warps, num_tiles, num_splits
 
 
+def validate_qsa_nvfp4_cake(
+    head_dim: int, num_query_heads: int, num_kv_heads: int
+) -> None:
+    if head_dim != 256 or num_query_heads > 16 * num_kv_heads:
+        raise NotImplementedError(
+            "QSA NVFP4 CAKE requires head_dim=256 and at most 16 query heads "
+            "per KV head"
+        )
+    if current_platform.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+        (12, 0),
+    ):
+        raise NotImplementedError(
+            "QSA NVFP4 CAKE requires SM100, SM103, SM107, or SM120"
+        )
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -648,8 +760,9 @@ def qsa_sparse_paged_attention(
     v_scale: float | None = None,
     *,
     output_gate: torch.Tensor,
+    is_nvfp4: bool = False,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
+    """Run sparse GQA over paged BF16, FP8-e4m3 or NVFP4 K/V.
 
     An fp8 cache is a native e4m3 view on sm_89+ and the raw uint8 storage
     below sm_89 (no Triton fp8e4nv pointer type there); the kernel dequantizes
@@ -664,6 +777,9 @@ def qsa_sparse_paged_attention(
     tile-loop bound. use_prefill_config steers the top of the config table (see
     _select_config). Large fp8 batches, prefill or decode, take the Blackwell
     kernel in qsa_fp8 (see qsa_fp8.use_fp8_decode_kernel).
+
+    NVFP4 uses FlashInfer CAKE to read the QAT cache in place.
+    Each K or V slot contains packed data followed by its E4M3 scales.
     """
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -677,13 +793,15 @@ def qsa_sparse_paged_attention(
         raise ValueError(
             "QSA packed indices need selection columns plus the count column"
         )
-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
-        raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
+    cache_width = nvfp4_kv_cache_full_dim(head_dim) if is_nvfp4 else head_dim
+    if cache_width != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+        raise ValueError("QSA sparse attention requires valid grouped-query heads")
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    is_fp8 = k_cache.dtype != torch.bfloat16
+    assert not is_nvfp4 or k_cache.dtype == torch.uint8
+    is_fp8 = not is_nvfp4 and k_cache.dtype != torch.bfloat16
     if is_fp8:
         assert k_scale is not None and v_scale is not None
         # Host pre-multiply: fold the K dequant scale into the attention scale
@@ -719,6 +837,31 @@ def qsa_sparse_paged_attention(
     output_gate_view = output_gate.view_as(q)
     if not q.shape[0]:
         return out
+
+    if is_nvfp4:
+        validate_qsa_nvfp4_cake(head_dim, q.shape[1], k_cache.shape[2])
+        from flashinfer.sparse import (
+            qsa_sparse_paged_attention as flashinfer_qsa_attention,
+        )
+
+        split = [head_dim // 2, head_dim // 16]
+        k_data, k_scales = k_cache.split(split, dim=-1)
+        v_data, v_scales = v_cache.split(split, dim=-1)
+        return flashinfer_qsa_attention(
+            q,
+            k_data,
+            v_data,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            k_scale=1.0,
+            v_scale=1.0,
+            output_gate=output_gate_view,
+            k_sf=k_scales.view(torch.float8_e4m3fn),
+            v_sf=v_scales.view(torch.float8_e4m3fn),
+        )
 
     if qsa_fp8.use_fp8_decode_kernel(q.shape[0] * k_cache.shape[2], k_cache.dtype):
         return qsa_fp8.qsa_sparse_paged_decode(
@@ -1161,9 +1304,223 @@ def qsa_compress_groups_with_ratio(
     return pooled, first_positions
 
 
+@triton.jit
+def _apply_primts_output_gate(out, gate, size, TILE: tl.constexpr):
+    i = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    value = tl.load(out + i, i < size, other=0).to(tl.float32)
+    logits = tl.load(gate + i, i < size, other=0).to(tl.float32)
+    tl.store(out + i, value * tl.sigmoid(logits), i < size)
+
+
+@dataclass
+class _QSAPrimTSPlan:
+    wrapper: QTokenKvBlockSparsePagedTSWrapper
+    offsets: torch.Tensor | None
+    captured: bool = False
+
+
+# Captured plans retain their offsets and workspace until worker shutdown.
+_primts_plans: OrderedDict[tuple, _QSAPrimTSPlan] = OrderedDict()
+
+
+def validate_qsa_nvfp4_primts() -> None:
+    try:
+        from flashinfer.attention.prims_ts.decode import (
+            suggest_q_token_kv_block_sparse_group_size,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "QSA NVFP4 PrimTS requires a FlashInfer build with native "
+            "NVFP4 QToken sparse attention"
+        ) from exc
+
+    if (
+        "nvfp4_kv"
+        not in signature(suggest_q_token_kv_block_sparse_group_size).parameters
+    ):
+        raise RuntimeError(
+            "QSA NVFP4 PrimTS requires FlashInfer's NVFP4 group-size policy "
+            "(FlashInfer #9659)"
+        )
+
+
+def qsa_nvfp4_primts_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_ids: torch.Tensor,
+    table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    positions: torch.Tensor,
+    query_offsets: tuple[int, ...],
+    compress_ratio: int,
+    is_prefill: bool,
+    out: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    force_single_query: bool = False,
+) -> None:
+    from flashinfer.attention.prims_ts.decode import (
+        suggest_q_token_kv_block_sparse_group_size,
+    )
+    from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+        QTokenKvBlockSparsePagedTSWrapper,
+        _wide_metadata_smem_bytes,
+        get_q_token_kv_block_sparse_workspace_size,
+    )
+
+    rows, q_heads, dim = q.shape
+    _, page, kv_heads, _ = k.shape
+    max_seq_len = table.shape[1] * page
+    topk = block_ids.shape[1]
+    k_hnd, v_hnd = k.transpose(1, 2), v.transpose(1, 2)
+    splits = not is_prefill
+    group = 1
+    if not force_single_query:
+        device = torch.cuda.get_device_properties(q.device)
+        group_args = (
+            len(query_offsets) - 1,
+            max(b - a for a, b in zip(query_offsets, query_offsets[1:])),
+            topk * compress_ratio + compress_ratio - 1,
+            q_heads,
+            kv_heads,
+            device.multi_processor_count,
+        )
+        group = suggest_q_token_kv_block_sparse_group_size(
+            *group_args,
+            head_dim=dim,
+            q_dtype=q.dtype,
+            split_kv=splits,
+            kv_block_size=compress_ratio,
+            nvfp4_kv=True,
+            seq_len_kv=max_seq_len,
+            packed_query=True,
+        )
+        if group > 8:
+            needed = _wide_metadata_smem_bytes(group, max_seq_len, compress_ratio)
+            if not 0 <= needed <= device.shared_memory_per_block_optin:
+                group = suggest_q_token_kv_block_sparse_group_size(
+                    *group_args,
+                    head_dim=dim,
+                    q_dtype=q.dtype,
+                    split_kv=splits,
+                    kv_block_size=compress_ratio,
+                )
+        logger.info_once(
+            "Qwen4Exp PrimTS QSA uses NVFP4 group %d for %d query rows "
+            "(prefill=%s, split_kv=%s).",
+            group,
+            rows,
+            is_prefill,
+            splits,
+        )
+    if group == 1:
+        q = q.view(rows, 1, 1, q_heads, dim)
+        offsets = ()
+        routes = rows
+    else:
+        offsets = tuple(
+            row
+            for a, b in zip(query_offsets, query_offsets[1:])
+            for row in range(a, b, group)
+        ) + (rows,)
+        routes = len(offsets) - 1
+    primts_out = out.view_as(q)
+
+    key = (
+        q.device,
+        k.data_ptr(),
+        v.data_ptr(),
+        table.shape,
+        page,
+        q_heads,
+        kv_heads,
+        dim,
+        topk,
+        compress_ratio,
+        splits,
+        group,
+        routes,
+        offsets,
+        q.stride(),
+        primts_out.stride(),
+        block_ids.stride(),
+        token_to_req.stride(),
+        positions.dtype,
+        positions.stride(),
+    )
+    plan = _primts_plans.get(key)
+    if plan is None:
+        indptr = None
+        if offsets:
+            indptr = torch.tensor(
+                offsets, dtype=torch.int32, device="cpu", pin_memory=True
+            ).to(q.device, non_blocking=True)
+        size = get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k_hnd,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=max_seq_len,
+            qo_indptr=indptr,
+            group_size=group,
+            kv_block_size=compress_ratio,
+            split_kv=splits,
+        )
+        wrapper = QTokenKvBlockSparsePagedTSWrapper()
+        wrapper.plan(
+            routes,
+            q_heads,
+            kv_heads,
+            dim,
+            compress_ratio,
+            page,
+            topk,
+            max_seq_len,
+            device=q.device,
+            workspace_buffer=torch.zeros(size, dtype=torch.uint8, device=q.device),
+            group_size=group,
+            packed_query=bool(offsets),
+            split_kv=splits,
+            q_dtype=q.dtype,
+            kv_dtype=k.dtype,
+            out_dtype=out.dtype,
+        )
+        plan = _QSAPrimTSPlan(wrapper, indptr)
+        _primts_plans[key] = plan
+        # Captured plans cannot be evicted and must not consume the slots
+        # needed to warm up the next graph's attention layers.
+        eager_keys = [key for key, plan in _primts_plans.items() if not plan.captured]
+        if len(eager_keys) > 48:
+            del _primts_plans[eager_keys[0]]
+    else:
+        _primts_plans.move_to_end(key)
+
+    plan.wrapper.run(
+        q,
+        (k_hnd, v_hnd),
+        table,
+        block_ids,
+        token_to_req,
+        positions,
+        qo_indptr=plan.offsets,
+        sm_scale=dim**-0.5,
+        v_scale=1.0,
+        out=primts_out,
+    )
+    if torch.cuda.is_current_stream_capturing():
+        plan.captured = True
+    _apply_primts_output_gate[(cdiv(out.numel(), 1024),)](out, gate, out.numel(), 1024)
+    logger.info_once("Qwen4Exp QSA is using PrimTS with inline QAT NVFP4 KV.")
+
+
 __all__ = [
     "qsa_compress_groups_with_ratio",
+    "qsa_nvfp4_primts_attention",
     "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",
+    "qsa_store_nvfp4_cache",
+    "validate_qsa_nvfp4_cake",
+    "validate_qsa_nvfp4_primts",
     "warmup_qsa_sparse_paged_attention",
 ]

@@ -21,8 +21,10 @@ from vllm.models.qwen4_exp.nvidia import qsa_indexer
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_fp8 as qsa_fp8_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSABackend
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.kv_cache_interface import AttentionSpec, get_kv_quant_mode
 from vllm.v1.worker.utils import clear_layer_kv_caches
 
 requires_qsa_kernels = pytest.mark.skipif(
@@ -35,10 +37,12 @@ requires_qsa_metadata_kernels = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("return_blocks", [False, True])
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
+    return_blocks: bool,
 ) -> None:
-    rows = torch.tensor([[3, 1, -1], [5, 2, 0]], dtype=torch.int32)
+    rows = torch.tensor([[3, 1, 6], [5, 2, 7]], dtype=torch.int32)
     raw_metadata = SimpleNamespace(
         num_actual_tokens=2,
         slot_mapping=torch.arange(2),
@@ -70,6 +74,7 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
         q_layernorm=SimpleNamespace(weight=torch.ones(1), variance_epsilon=1e-6),
         k_layernorm=SimpleNamespace(weight=torch.ones(1)),
         compress_ratio=2,
+        token_topk=4,
     )
     attn = SimpleNamespace(
         use_fused_qsa_prepare=True,
@@ -97,7 +102,7 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
         lambda *args, **kwargs: selections.append((args, kwargs)),
     )
 
-    actual, _ = qsa_indexer.QSAIndexer.forward(
+    actual, _, selection_positions = qsa_indexer.QSAIndexer.forward(
         indexer,
         torch.zeros(2, 2),
         torch.tensor([7, 8]),
@@ -105,9 +110,15 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
         attn=attn,
         qkv=torch.zeros(2, 4),
         slot_mapping=torch.arange(2),
+        return_blocks=return_blocks,
     )
 
-    assert actual is rows
+    if return_blocks:
+        torch.testing.assert_close(actual, rows[:, :2])
+        torch.testing.assert_close(selection_positions, rows[:, 2])
+    else:
+        assert actual is rows
+        assert selection_positions is None
     assert len(updates) == 1
     assert not selections
 
@@ -254,6 +265,101 @@ def _qsa_sparse_paged_attention_reference(
         probabilities = torch.softmax(scores * softmax_scale, dim=-1)
         output[row] = torch.einsum("hk,khd->hd", probabilities, values).to(q.dtype)
     return output
+
+
+@requires_qsa_kernels
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(89), reason="NVFP4 needs SM89+"
+)
+@pytest.mark.parametrize("num_pages", [1, 2])
+def test_qsa_nvfp4_writer_preserves_signed_zero(num_pages: int) -> None:
+    rows = torch.zeros((1, 1, 16), device="cuda", dtype=torch.bfloat16)
+    rows[0, 0, 0] = -0.0
+    rows[0, 0, 1] = -(2**-14)
+    cache = torch.empty((num_pages, 1, 1, 9), device="cuda", dtype=torch.uint8)
+    slots = torch.zeros(1, device="cuda", dtype=torch.int64)
+    qsa_ops.qsa_store_nvfp4_cache(cache, slots, rows)
+    expected = torch.tensor([0x88] + [0] * 7, device="cuda", dtype=torch.uint8)
+    torch.testing.assert_close(cache[0, 0, 0, :8], expected)
+
+
+@requires_qsa_kernels
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(89), reason="NVFP4 needs SM89+"
+)
+def test_qsa_nvfp4_paged_cache_matches_reference() -> None:
+    """Compare written cache bytes with independent QAT quantization."""
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    page_size, head_dim, num_heads = 16, 64, 2
+    spec = Qwen4ExpQSABackend.customize_spec(
+        AttentionSpec(
+            block_size=page_size,
+            num_kv_heads=num_heads,
+            head_size=head_dim,
+            dtype=torch.uint8,
+            kv_quant_mode=get_kv_quant_mode("nvfp4"),
+        )
+    )
+    assert spec.page_size_bytes == page_size * num_heads * 2 * 36
+    # Match the backend's view, including interleaved K/V within each head slot.
+    backing = torch.full(
+        (2, num_heads, page_size, 2 * 36), 0xFF, dtype=torch.uint8, device=device
+    )
+    packed_k, packed_v = backing.transpose(1, 2).split(36, dim=-1)
+    slots = torch.tensor([17, 0, 5, 30, -1], device=device)
+    src = torch.randn(2, 6, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    key, value = src.unbind()
+    # Exact ties with scale = 1 exercise the even-code rule and signed zeros.
+    key[0, 0, :16] = torch.tensor(
+        [6, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, -0.0, -0.25, -6] + [0] * 5,
+        device=device,
+    )
+    key[0, 1, 0] = torch.nan
+    value[0, 1, 16] = torch.inf
+
+    for x, packed in ((key, packed_k), (value, packed_v)):
+        qsa_ops.qsa_store_nvfp4_cache(packed, slots, x)
+        # Choose the nearest grid entry, giving even codes first priority on ties.
+        values = x[:4].float().unflatten(-1, (-1, 16))
+        amax = values.abs().amax(-1)
+        scale = (amax * (1 / 6)).clamp(2**-9, 448).to(torch.float8_e4m3fn)
+        scale = torch.where(amax.isfinite(), scale.view(torch.uint8), 0x7F).view(
+            torch.float8_e4m3fn
+        )
+        codes = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=device)
+        table = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=device)
+        grid = scale.float()[..., None, None] * table[codes]
+        magnitudes = codes[(values.abs().unsqueeze(-1) - grid).abs().argmin(-1)]
+        nibbles = magnitudes | (values.signbit().to(torch.int64) << 3)
+        even, odd = nibbles.unflatten(-1, (8, 2)).unbind(-1)
+        bytes_ = (even | (odd << 4)).to(torch.uint8)
+        selected = packed[slots[:4] // page_size, slots[:4] % page_size]
+        assert torch.equal(selected[..., 32:], scale.view(torch.uint8))
+        assert torch.equal(
+            selected[..., :32].unflatten(-1, (4, 8))[amax.isfinite()],
+            bytes_[amax.isfinite()],
+        )
+        written = torch.zeros((2, page_size), dtype=torch.bool, device=device)
+        written[slots[:4] // page_size, slots[:4] % page_size] = True
+        assert (packed[~written] == 0xFF).all()
+
+
+def test_qsa_nvfp4_rejects_unsupported_cake_shape() -> None:
+    query = torch.empty(1, 4, 64, dtype=torch.bfloat16)
+    cache = torch.empty(1, 16, 1, 36, dtype=torch.uint8)
+    with pytest.raises(NotImplementedError, match="CAKE requires head_dim=256"):
+        qsa_ops.qsa_sparse_paged_attention(
+            query,
+            cache,
+            cache,
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            False,
+            output_gate=torch.empty_like(query),
+            is_nvfp4=True,
+        )
 
 
 @requires_qsa_metadata_kernels

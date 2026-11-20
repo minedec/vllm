@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -23,6 +24,7 @@ class Qwen4ExpQSAMetadata(AttentionMetadata):
     max_query_len: int
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    primts_query_offsets: tuple[int, ...] = ()
 
 
 class Qwen4ExpQSAMetadataBuilder(AttentionMetadataBuilder[Qwen4ExpQSAMetadata]):
@@ -38,6 +40,10 @@ class Qwen4ExpQSAMetadataBuilder(AttentionMetadataBuilder[Qwen4ExpQSAMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.use_nvfp4_primts = (
+            kv_cache_spec.kv_quant_mode.is_nvfp4
+            and envs.VLLM_QSA_ATTENTION_BACKEND == "prims_ts"
+        )
 
     def build(
         self,
@@ -51,6 +57,11 @@ class Qwen4ExpQSAMetadataBuilder(AttentionMetadataBuilder[Qwen4ExpQSAMetadata]):
             max_query_len=common_attn_metadata.max_query_len,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
+            primts_query_offsets=(
+                tuple(common_attn_metadata.query_start_loc_cpu.tolist())
+                if self.use_nvfp4_primts
+                else ()
+            ),
         )
 
     def update_block_table(

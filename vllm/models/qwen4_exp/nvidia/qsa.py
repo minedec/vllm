@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -59,16 +58,15 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
 from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
 from . import model
+from .ops.qsa import (
+    qsa_nvfp4_primts_attention,
+    qsa_sparse_paged_attention,
+    qsa_store_nvfp4_cache,
+    validate_qsa_nvfp4_cake,
+    validate_qsa_nvfp4_primts,
+)
 from .ops.qsa_indexer import _TOPK_WORKSPACE_BYTES
 from .qsa_indexer import QSAIndexer
-
-_QSA_CACHE_DTYPES: tuple[CacheDType, ...] = (
-    "auto",
-    "bfloat16",
-    "fp8",
-    "fp8_e4m3",
-    "nvfp4",
-)
 
 
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
@@ -144,7 +142,13 @@ class Qwen4ExpQSABackend(AttentionBackend):
     # fp8/fp8_e4m3: e4m3 bytes in a uint8 cache, written by reshape_and_cache
     # with the layer's per-tensor scales and dequantized on load inside the QSA
     # Triton kernel.
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = list(_QSA_CACHE_DTYPES)
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "nvfp4",
+    ]
 
     # The owner writes K/V before calling the sparse attention implementation.
     forward_includes_kv_cache_update: bool = False
@@ -157,16 +161,6 @@ class Qwen4ExpQSABackend(AttentionBackend):
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # QSA consumes manager pages directly and does not use FA4 paged attention.
         return [MultipleOf(16)]
-
-    @classmethod
-    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        if not spec.kv_quant_mode.is_nvfp4:
-            return spec
-        # Each head slot stores [K data | K scales | V data | V scales].
-        return replace(
-            spec,
-            state_content_bytes=2 * nvfp4_kv_cache_full_dim(spec.head_size),
-        )
 
     @staticmethod
     def get_impl_cls() -> type[Qwen4ExpQSAImpl]:
@@ -200,7 +194,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if kv_cache_dtype not in _QSA_CACHE_DTYPES:
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires a BF16, FP8-e4m3 or NVFP4 main KV cache"
             )
@@ -214,22 +208,8 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             self.is_nvfp4 and envs.VLLM_QSA_ATTENTION_BACKEND == "prims_ts"
         )
         if self.use_nvfp4_primts:
-            if head_size != 256:
-                raise NotImplementedError("QSA NVFP4 PrimTS requires head_dim=256")
-            if current_platform.get_device_capability() not in (
-                (10, 0),
-                (10, 3),
-                (10, 7),
-            ):
-                raise NotImplementedError(
-                    "QSA NVFP4 PrimTS requires SM100, SM103, or SM107"
-                )
-            from .ops.qsa import validate_qsa_nvfp4_primts
-
-            validate_qsa_nvfp4_primts()
+            validate_qsa_nvfp4_primts(head_size)
         elif self.is_nvfp4:
-            from .ops.qsa import validate_qsa_nvfp4_cake
-
             validate_qsa_nvfp4_cake(head_size, num_heads, num_kv_heads)
         self.cache_head_size = (
             nvfp4_kv_cache_full_dim(head_size) if self.is_nvfp4 else head_size
@@ -244,12 +224,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         slot_mapping: torch.Tensor,
     ) -> None:
         """Scatter K/V using the same layout and scales as the fused writer."""
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.cache_head_size, dim=-1
-        )
+        cache_head_size = self.cache_head_size
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(cache_head_size, dim=-1)
         if self.is_nvfp4:
-            from .ops.qsa import qsa_store_nvfp4_cache
-
             qsa_store_nvfp4_cache(key_cache, slot_mapping, key)
             qsa_store_nvfp4_cache(value_cache, slot_mapping, value)
             return
@@ -287,12 +264,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             return output
 
         token_to_req = token_to_req[:num_tokens]
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.cache_head_size, dim=-1
-        )
+        cache_head_size = self.cache_head_size
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(cache_head_size, dim=-1)
         if self.use_nvfp4_primts:
-            from .ops.qsa import qsa_nvfp4_primts_attention
-
             assert selection_positions is not None
             qsa_nvfp4_primts_attention(
                 query[:num_tokens],
@@ -330,8 +304,6 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires BF16 Q and BF16, FP8-e4m3 or NVFP4 K/V"
             )
-
-        from .ops.qsa import qsa_sparse_paged_attention
 
         qsa_sparse_paged_attention(
             query[:num_tokens],
@@ -373,7 +345,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in _QSA_CACHE_DTYPES:
+        if cache_config.cache_dtype not in (
+            "auto",
+            "bfloat16",
+            "fp8",
+            "fp8_e4m3",
+            "nvfp4",
+        ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires a BF16, FP8-e4m3 or NVFP4 main KV cache"
             )
@@ -527,9 +505,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
             del self.indexer.index_qk_proj
 
-        # MTP skip_topk steps reuse rows frozen from step 0; the valid count
-        # is a row column, so compaction/reuse keep it paired with the content.
+        # MTP compacts entire step-0 rows, including the valid count on the
+        # token-index path or the causal position on the PrimTS path.
         self.topk_indices_buffer = topk_indices_buffer
+        self.preserve_selection = layer_id >= config.num_hidden_layers
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -561,6 +540,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            state_content_bytes=(
+                2 * self.impl.cache_head_size if self.impl.is_nvfp4 else None
+            ),
         )
         return FullAttentionManager.layer_config(spec)
 
@@ -617,10 +599,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             QSAIndexerMetadata,
             metadata[self.indexer.raw_key_cache.prefix],
         )
-        selected, main_outputs, selection_positions = self.indexer(
+        topk_buffer = self.topk_indices_buffer[:num_tokens]
+        selected, main_outputs = self.indexer(
             projected_qk,
             positions,
-            self.topk_indices_buffer[:num_tokens],
+            topk_buffer,
             attn=self,
             qkv=qkv,
             slot_mapping=main_metadata.slot_mapping,
@@ -633,6 +616,19 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if selected.shape != (num_tokens, selection_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
+        selection_positions = None
+        if self.impl.use_nvfp4_primts:
+            if self.indexer.skip_topk:
+                selection_positions = topk_buffer[:, selection_width].contiguous()
+            else:
+                compressed_metadata = cast(
+                    QSAIndexerMetadata,
+                    metadata[self.indexer.compressed_key_cache.prefix],
+                )
+                selection_positions = compressed_metadata.logical_positions[:num_tokens]
+                if self.preserve_selection:
+                    topk_buffer[:, :selection_width].copy_(selected)
+                    topk_buffer[:, selection_width].copy_(selection_positions)
         if main_outputs is None:
             assert key is not None and value is not None
             self.impl.do_kv_cache_update(

@@ -21,10 +21,8 @@ from vllm.models.qwen4_exp.nvidia import qsa_indexer
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_fp8 as qsa_fp8_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
-from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSABackend
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
-from vllm.v1.kv_cache_interface import AttentionSpec, get_kv_quant_mode
 from vllm.v1.worker.utils import clear_layer_kv_caches
 
 requires_qsa_kernels = pytest.mark.skipif(
@@ -102,7 +100,7 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
         lambda *args, **kwargs: selections.append((args, kwargs)),
     )
 
-    actual, _, selection_positions = qsa_indexer.QSAIndexer.forward(
+    actual, _ = qsa_indexer.QSAIndexer.forward(
         indexer,
         torch.zeros(2, 2),
         torch.tensor([7, 8]),
@@ -115,10 +113,8 @@ def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
 
     if return_blocks:
         torch.testing.assert_close(actual, rows[:, :2])
-        torch.testing.assert_close(selection_positions, rows[:, 2])
     else:
         assert actual is rows
-        assert selection_positions is None
     assert len(updates) == 1
     assert not selections
 
@@ -292,16 +288,6 @@ def test_qsa_nvfp4_paged_cache_matches_reference() -> None:
     torch.manual_seed(13)
     device = torch.device("cuda")
     page_size, head_dim, num_heads = 16, 64, 2
-    spec = Qwen4ExpQSABackend.customize_spec(
-        AttentionSpec(
-            block_size=page_size,
-            num_kv_heads=num_heads,
-            head_size=head_dim,
-            dtype=torch.uint8,
-            kv_quant_mode=get_kv_quant_mode("nvfp4"),
-        )
-    )
-    assert spec.page_size_bytes == page_size * num_heads * 2 * 36
     # Match the backend's view, including interleaved K/V within each head slot.
     backing = torch.full(
         (2, num_heads, page_size, 2 * 36), 0xFF, dtype=torch.uint8, device=device

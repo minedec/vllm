@@ -20,12 +20,27 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.models.qwen4_exp.nvidia.ops import qsa_fp8
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 
 if TYPE_CHECKING:
-    from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
-        QTokenKvBlockSparsePagedTSWrapper,
+    import flashinfer.sparse as flashinfer_sparse
+    from flashinfer.attention.prims_ts import (
+        decode as primts_decode,
+    )
+    from flashinfer.attention.prims_ts import (
+        q_token_kv_block_sparse_metadata as primts_metadata,
+    )
+else:
+    flashinfer_sparse = LazyLoader("flashinfer_sparse", globals(), "flashinfer.sparse")
+    primts_decode = LazyLoader(
+        "primts_decode", globals(), "flashinfer.attention.prims_ts.decode"
+    )
+    primts_metadata = LazyLoader(
+        "primts_metadata",
+        globals(),
+        "flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata",
     )
 
 logger = init_logger(__name__)
@@ -840,14 +855,10 @@ def qsa_sparse_paged_attention(
 
     if is_nvfp4:
         validate_qsa_nvfp4_cake(head_dim, q.shape[1], k_cache.shape[2])
-        from flashinfer.sparse import (
-            qsa_sparse_paged_attention as flashinfer_qsa_attention,
-        )
-
         split = [head_dim // 2, head_dim // 16]
         k_data, k_scales = k_cache.split(split, dim=-1)
         v_data, v_scales = v_cache.split(split, dim=-1)
-        return flashinfer_qsa_attention(
+        return flashinfer_sparse.qsa_sparse_paged_attention(
             q,
             k_data,
             v_data,
@@ -1314,7 +1325,7 @@ def _apply_primts_output_gate(out, gate, size, TILE: tl.constexpr):
 
 @dataclass
 class _QSAPrimTSPlan:
-    wrapper: QTokenKvBlockSparsePagedTSWrapper
+    wrapper: primts_metadata.QTokenKvBlockSparsePagedTSWrapper
     offsets: torch.Tensor | None
     captured: bool = False
 
@@ -1323,21 +1334,20 @@ class _QSAPrimTSPlan:
 _primts_plans: OrderedDict[tuple, _QSAPrimTSPlan] = OrderedDict()
 
 
-def validate_qsa_nvfp4_primts() -> None:
+def validate_qsa_nvfp4_primts(head_dim: int) -> None:
+    if head_dim != 256:
+        raise NotImplementedError("QSA NVFP4 PrimTS requires head_dim=256")
+    if current_platform.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        raise NotImplementedError("QSA NVFP4 PrimTS requires SM100, SM103, or SM107")
     try:
-        from flashinfer.attention.prims_ts.decode import (
-            suggest_q_token_kv_block_sparse_group_size,
-        )
-    except ImportError as exc:
+        suggest_group_size = primts_decode.suggest_q_token_kv_block_sparse_group_size
+    except (AttributeError, ImportError) as exc:
         raise RuntimeError(
             "QSA NVFP4 PrimTS requires a FlashInfer build with native "
             "NVFP4 QToken sparse attention"
         ) from exc
 
-    if (
-        "nvfp4_kv"
-        not in signature(suggest_q_token_kv_block_sparse_group_size).parameters
-    ):
+    if "nvfp4_kv" not in signature(suggest_group_size).parameters:
         raise RuntimeError(
             "QSA NVFP4 PrimTS requires FlashInfer's NVFP4 group-size policy "
             "(FlashInfer #9659)"
@@ -1360,15 +1370,6 @@ def qsa_nvfp4_primts_attention(
     *,
     force_single_query: bool = False,
 ) -> None:
-    from flashinfer.attention.prims_ts.decode import (
-        suggest_q_token_kv_block_sparse_group_size,
-    )
-    from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
-        QTokenKvBlockSparsePagedTSWrapper,
-        _wide_metadata_smem_bytes,
-        get_q_token_kv_block_sparse_workspace_size,
-    )
-
     rows, q_heads, dim = q.shape
     _, page, kv_heads, _ = k.shape
     max_seq_len = table.shape[1] * page
@@ -1386,7 +1387,7 @@ def qsa_nvfp4_primts_attention(
             kv_heads,
             device.multi_processor_count,
         )
-        group = suggest_q_token_kv_block_sparse_group_size(
+        group = primts_decode.suggest_q_token_kv_block_sparse_group_size(
             *group_args,
             head_dim=dim,
             q_dtype=q.dtype,
@@ -1397,9 +1398,11 @@ def qsa_nvfp4_primts_attention(
             packed_query=True,
         )
         if group > 8:
-            needed = _wide_metadata_smem_bytes(group, max_seq_len, compress_ratio)
+            needed = primts_metadata._wide_metadata_smem_bytes(
+                group, max_seq_len, compress_ratio
+            )
             if not 0 <= needed <= device.shared_memory_per_block_optin:
-                group = suggest_q_token_kv_block_sparse_group_size(
+                group = primts_decode.suggest_q_token_kv_block_sparse_group_size(
                     *group_args,
                     head_dim=dim,
                     q_dtype=q.dtype,
@@ -1456,7 +1459,7 @@ def qsa_nvfp4_primts_attention(
             indptr = torch.tensor(
                 offsets, dtype=torch.int32, device="cpu", pin_memory=True
             ).to(q.device, non_blocking=True)
-        size = get_q_token_kv_block_sparse_workspace_size(
+        size = primts_metadata.get_q_token_kv_block_sparse_workspace_size(
             q,
             k_hnd,
             table,
@@ -1467,7 +1470,7 @@ def qsa_nvfp4_primts_attention(
             kv_block_size=compress_ratio,
             split_kv=splits,
         )
-        wrapper = QTokenKvBlockSparsePagedTSWrapper()
+        wrapper = primts_metadata.QTokenKvBlockSparsePagedTSWrapper()
         wrapper.plan(
             routes,
             q_heads,

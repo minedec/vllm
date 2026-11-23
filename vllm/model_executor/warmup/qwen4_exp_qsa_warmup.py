@@ -27,9 +27,13 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
     for layer in worker.get_model().modules():
         if indexer is None and isinstance(layer, qsa_module.QSAIndexer):
             indexer = layer
-        elif owner is None and isinstance(layer, attn_module.Qwen4ExpQSAAttention):
+        elif (
+            owner is None
+            and isinstance(layer, attn_module.Qwen4ExpQSAAttention)
+            and not layer.impl.is_nvfp4
+        ):
             owner = layer
-    if indexer is None or owner is None:
+    if indexer is None:
         return
 
     runner = worker.model_runner
@@ -89,7 +93,7 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
             prefill_width,
         )
 
-    if owner.impl.is_nvfp4:
+    if owner is None:
         return
 
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (

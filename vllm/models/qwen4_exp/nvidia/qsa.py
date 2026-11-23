@@ -60,7 +60,6 @@ from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
 from . import model
 from .ops.qsa import (
     qsa_nvfp4_primts_attention,
-    qsa_sparse_paged_attention,
     qsa_store_nvfp4_cache,
     validate_qsa_nvfp4_cake,
     validate_qsa_nvfp4_primts,
@@ -304,6 +303,8 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires BF16 Q and BF16, FP8-e4m3 or NVFP4 K/V"
             )
+
+        from .ops.qsa import qsa_sparse_paged_attention
 
         qsa_sparse_paged_attention(
             query[:num_tokens],
@@ -599,11 +600,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             QSAIndexerMetadata,
             metadata[self.indexer.raw_key_cache.prefix],
         )
-        topk_buffer = self.topk_indices_buffer[:num_tokens]
         selected, main_outputs = self.indexer(
             projected_qk,
             positions,
-            topk_buffer,
+            self.topk_indices_buffer[:num_tokens],
             attn=self,
             qkv=qkv,
             slot_mapping=main_metadata.slot_mapping,
@@ -619,7 +619,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         selection_positions = None
         if self.impl.use_nvfp4_primts:
             if self.indexer.skip_topk:
-                selection_positions = topk_buffer[:, selection_width].contiguous()
+                selection_positions = self.topk_indices_buffer[
+                    :num_tokens, selection_width
+                ].contiguous()
             else:
                 compressed_metadata = cast(
                     QSAIndexerMetadata,
@@ -627,8 +629,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 )
                 selection_positions = compressed_metadata.logical_positions[:num_tokens]
                 if self.preserve_selection:
-                    topk_buffer[:, :selection_width].copy_(selected)
-                    topk_buffer[:, selection_width].copy_(selection_positions)
+                    self.topk_indices_buffer[:num_tokens, :selection_width].copy_(
+                        selected
+                    )
+                    self.topk_indices_buffer[:num_tokens, selection_width].copy_(
+                        selection_positions
+                    )
         if main_outputs is None:
             assert key is not None and value is not None
             self.impl.do_kv_cache_update(

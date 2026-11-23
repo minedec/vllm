@@ -252,7 +252,6 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         use_prefill_config: bool,
         output_gate: torch.Tensor,
         selected: torch.Tensor,
-        selection_positions: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run sparse attention over the owner's indexer-selected K/V rows."""
         num_tokens = attn_metadata.num_actual_tokens
@@ -266,7 +265,28 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
         cache_head_size = self.cache_head_size
         key_cache, value_cache = kv_cache.transpose(1, 2).split(cache_head_size, dim=-1)
         if self.use_nvfp4_primts:
-            assert selection_positions is not None
+            selection_width = selected.shape[1]
+            if layer.indexer.skip_topk:
+                selection_positions = layer.topk_indices_buffer[
+                    :num_tokens, selection_width
+                ].contiguous()
+            else:
+                metadata = get_forward_context().attn_metadata
+                if isinstance(metadata, list):
+                    metadata = metadata[0]
+                assert isinstance(metadata, dict)
+                compressed_metadata = cast(
+                    QSAIndexerMetadata,
+                    metadata[layer.indexer.compressed_key_cache.prefix],
+                )
+                selection_positions = compressed_metadata.logical_positions[:num_tokens]
+                if layer.preserve_selection:
+                    layer.topk_indices_buffer[:num_tokens, :selection_width].copy_(
+                        selected
+                    )
+                    layer.topk_indices_buffer[:num_tokens, selection_width].copy_(
+                        selection_positions
+                    )
             qsa_nvfp4_primts_attention(
                 query[:num_tokens],
                 key_cache,
@@ -283,6 +303,11 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
                 force_single_query=layer.indexer.skip_topk,
             )
             return output
+
+        topk_buffer = getattr(layer, "topk_indices_buffer", None)
+        if topk_buffer is None:
+            raise RuntimeError("QSA owner did not provide its top-k buffer")
+        logical_indices = topk_buffer[:num_tokens]
         k_scale = v_scale = None
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             # The cache is allocated as uint8; on sm_89+ reinterpret the e4m3
@@ -310,7 +335,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             query[:num_tokens],
             key_cache,
             value_cache,
-            selected,
+            logical_indices,
             attn_metadata.block_table,
             token_to_req,
             use_prefill_config,
@@ -616,25 +641,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if selected.shape != (num_tokens, selection_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
-        selection_positions = None
-        if self.impl.use_nvfp4_primts:
-            if self.indexer.skip_topk:
-                selection_positions = self.topk_indices_buffer[
-                    :num_tokens, selection_width
-                ].contiguous()
-            else:
-                compressed_metadata = cast(
-                    QSAIndexerMetadata,
-                    metadata[self.indexer.compressed_key_cache.prefix],
-                )
-                selection_positions = compressed_metadata.logical_positions[:num_tokens]
-                if self.preserve_selection:
-                    self.topk_indices_buffer[:num_tokens, :selection_width].copy_(
-                        selected
-                    )
-                    self.topk_indices_buffer[:num_tokens, selection_width].copy_(
-                        selection_positions
-                    )
         if main_outputs is None:
             assert key is not None and value is not None
             self.impl.do_kv_cache_update(
@@ -657,7 +663,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
             output_gate=output_gate,
             selected=selected,
-            selection_positions=selection_positions,
         )
 
     def forward(

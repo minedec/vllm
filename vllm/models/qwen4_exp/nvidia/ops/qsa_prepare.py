@@ -6,6 +6,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .qsa import _store_qat_row
+
 
 @triton.jit
 def _norm_rope(
@@ -171,6 +173,7 @@ def _qsa_prepare_kernel(
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    MAIN_NVFP4: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -225,9 +228,21 @@ def _qsa_prepare_kernel(
                     + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
                 v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                if MAIN_NVFP4:
+                    rotated_dim = dims % HALF
+                    lower = tl.gather(o1, rotated_dim, 0)
+                    upper = tl.gather(o2, rotated_dim, 0)
+                    key = tl.where(
+                        dims < HALF, lower, tl.where(dims < 2 * HALF, upper, y)
+                    )
+                    _store_qat_row(dst, key.to(tl.bfloat16).to(tl.float32), MAIN_D)
+                    _store_qat_row(
+                        dst + MAIN_D // 2 + MAIN_D // 16, v.to(tl.float32), MAIN_D
+                    )
+                else:
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
             _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
@@ -530,6 +545,7 @@ def qsa_prepare(
     main_slot_mapping: torch.Tensor,
     main_k_scale: float,
     main_v_scale: float,
+    main_nvfp4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize Q, compress K, then update the circular raw state.
 
@@ -537,7 +553,7 @@ def qsa_prepare(
     and returns its Q and gate.
     """
     num_tokens = q.shape[0]
-    main_head_dim = main_kv_cache.shape[-1] // 2
+    main_head_dim = main_q_norm_weight.numel()
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
@@ -641,6 +657,7 @@ def qsa_prepare(
         MAIN_HQ=num_main_q_heads,
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
+        MAIN_NVFP4=main_nvfp4,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
         num_warps=1,
     )

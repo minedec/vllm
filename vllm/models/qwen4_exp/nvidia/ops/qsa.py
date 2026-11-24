@@ -89,6 +89,33 @@ def _maybe_dequant(tile):
 
 
 @triton.jit
+def _store_qat_row(dst, x, HEAD_DIM: tl.constexpr):
+    groups = tl.reshape(x, (HEAD_DIM // 16, 16))
+    abs_x = tl.abs(groups)
+    amax = tl.max(tl.where(abs_x == abs_x, abs_x, float("inf")), axis=1)
+    scale = tl.clamp(amax * (1.0 / 6.0), 2.0**-9, 448.0).to(tl.float8e4nv)
+    scale_bytes = tl.where(
+        amax < float("inf"), scale.to(tl.uint8, bitcast=True), 0x7F
+    ).to(tl.uint8)
+    # Scaled midpoints and alternating comparisons give round-to-nearest-even
+    # without division rounding a value to the wrong side of a tie.
+    s = scale.to(tl.float32)[:, None]
+    code = (
+        (abs_x > 0.25 * s).to(tl.int32)
+        + (abs_x >= 0.75 * s).to(tl.int32)
+        + (abs_x > 1.25 * s).to(tl.int32)
+        + (abs_x >= 1.75 * s).to(tl.int32)
+        + (abs_x > 2.5 * s).to(tl.int32)
+        + (abs_x >= 3.5 * s).to(tl.int32)
+        + (abs_x > 5.0 * s).to(tl.int32)
+    )
+    sign = (groups.to(tl.int32, bitcast=True) >> 31) & 1
+    lo, hi = tl.split(tl.reshape(code | (sign << 3), (HEAD_DIM // 2, 2)))
+    tl.store(dst + tl.arange(0, HEAD_DIM // 2), (lo | (hi << 4)).to(tl.uint8))
+    tl.store(dst + HEAD_DIM // 2 + tl.arange(0, HEAD_DIM // 16), scale_bytes)
+
+
+@triton.jit
 def _store_nvfp4_kernel(
     cache,
     slots,
@@ -117,35 +144,13 @@ def _store_nvfp4_kernel(
         + head * stride_row_head
         + dims * stride_row_dim
     ).to(tl.float32)
-    groups = tl.reshape(x, (HEAD_DIM // 16, 16))
-    abs_x = tl.abs(groups)
-    amax = tl.max(tl.where(abs_x == abs_x, abs_x, float("inf")), axis=1)
-    scale = tl.clamp(amax * (1.0 / 6.0), 2.0**-9, 448.0).to(tl.float8e4nv)
-    scale_bytes = tl.where(
-        amax < float("inf"), scale.to(tl.uint8, bitcast=True), 0x7F
-    ).to(tl.uint8)
-    # Scaled midpoints and alternating comparisons give round-to-nearest-even
-    # without division rounding a value to the wrong side of a tie.
-    s = scale.to(tl.float32)[:, None]
-    code = (
-        (abs_x > 0.25 * s).to(tl.int32)
-        + (abs_x >= 0.75 * s).to(tl.int32)
-        + (abs_x > 1.25 * s).to(tl.int32)
-        + (abs_x >= 1.75 * s).to(tl.int32)
-        + (abs_x > 2.5 * s).to(tl.int32)
-        + (abs_x >= 3.5 * s).to(tl.int32)
-        + (abs_x > 5.0 * s).to(tl.int32)
-    )
-    sign = (groups.to(tl.int32, bitcast=True) >> 31) & 1
-    lo, hi = tl.split(tl.reshape(code | (sign << 3), (HEAD_DIM // 2, 2)))
     dst = (
         cache
         + page * stride_block
         + (slot % PAGE_SIZE) * stride_token
         + head * stride_head
     )
-    tl.store(dst + tl.arange(0, HEAD_DIM // 2), (lo | (hi << 4)).to(tl.uint8))
-    tl.store(dst + HEAD_DIM // 2 + tl.arange(0, HEAD_DIM // 16), scale_bytes)
+    _store_qat_row(dst, x, HEAD_DIM)
 
 
 def qsa_store_nvfp4_cache(

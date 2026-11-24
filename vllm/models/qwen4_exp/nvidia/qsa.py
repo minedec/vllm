@@ -506,8 +506,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.use_fused_qsa_prepare = (
             self.use_fused_qk_norm_rope_gate
             and self.indexer.use_fused_pre_indexer
-            # The fused prepare writer only accepts BF16 or FP8.
-            and not self.impl.is_nvfp4
             and (
                 self.kv_cache_torch_dtype != torch.uint8
                 or current_platform.has_device_capability(89)

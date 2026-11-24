@@ -1382,6 +1382,8 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         extras={"mammoth": "baselabs/mammoth-1"},
         max_model_len=4096,
     ),
+    "Qwen4ForConditionalGeneration": _HfExamplesInfo("", is_available_online=False),
+    "Qwen4MoeForConditionalGeneration": _HfExamplesInfo("", is_available_online=False),
     "Qwen4ExpForConditionalGeneration": _HfExamplesInfo(
         "",
         is_available_online=False,

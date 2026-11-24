@@ -2268,7 +2268,12 @@ def initialize_model_parallel(
             # spreads the table's vocab over the DP ranks, so they hold different rows.
             or (
                 config.model_config.architecture
-                in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
+                in (
+                    "Qwen4ExpForCausalLM",
+                    "Qwen4ExpForConditionalGeneration",
+                    "Qwen4ForConditionalGeneration",
+                    "Qwen4MoeForConditionalGeneration",
+                )
                 and engram_config.dp_shared_memory
                 and not engram_config.embedding_across_dp
             )

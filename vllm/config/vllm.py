@@ -131,6 +131,8 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "MuseSparkForConditionalGeneration",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        "Qwen4ForConditionalGeneration",
+        "Qwen4MoeForConditionalGeneration",
         "Qwen4ExpMTP",
         "Step5ForCausalLM",
         "Step5ForConditionalGeneration",
@@ -1564,6 +1566,10 @@ class VllmConfig:
             in (
                 "Qwen4ExpForCausalLM",
                 "Qwen4ExpForConditionalGeneration",
+                "Qwen4ForConditionalGeneration",
+                "Qwen4MoeForConditionalGeneration",
+                "Qwen4ForConditionalGeneration",
+                "Qwen4MoeForConditionalGeneration",
             )
         ):
             if self.parallel_config.use_ubatching:

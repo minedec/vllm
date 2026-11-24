@@ -40,6 +40,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
+from vllm.model_executor.models.llama import LlamaMLP
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
@@ -199,6 +200,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.layer_idx = extract_layer_index(prefix)
         self.use_sequence_parallel = (
             vllm_config.parallel_config.use_sequence_parallel_moe
+            and bool(config.num_experts)
         )
         self.ple: Qwen4ExpPLELayer | None = None
         ple_layer_ids = config.ple_layer_ids
@@ -248,11 +250,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen4ExpSparseMoeBlock(
-            vllm_config=vllm_config,
-            prefix=f"{prefix}.mlp",
-            reduce_results=not self.use_hc_sequence_parallel,
-        )
+        if config.num_experts == 0:
+            self.mlp = LlamaMLP(
+                config.hidden_size,
+                config.intermediate_size,
+                config.hidden_act,
+                quant_config,
+                prefix=f"{prefix}.mlp",
+                reduce_results=not self.use_hc_sequence_parallel,
+            )
+        else:
+            self.mlp = Qwen4ExpSparseMoeBlock(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.mlp",
+                reduce_results=not self.use_hc_sequence_parallel,
+            )
 
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
@@ -336,8 +348,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 block_input = sp_all_gather(block_input)[: positions.shape[-1]]
             mlp_out = self.mlp(block_input)
             if self.use_hc_sequence_parallel:
-                assert isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
-                reduce_output = self.mlp.experts.moe_config.skip_final_all_reduce
+                reduce_output = (
+                    isinstance(self.mlp, LlamaMLP)
+                    or self.mlp.experts.moe_config.skip_final_all_reduce
+                )
                 # Only sum partial outputs. Reduced outputs already include all ranks.
                 mlp_out = (
                     sp_reduce_scatter(mlp_out) if reduce_output else sp_shard(mlp_out)
@@ -633,6 +647,14 @@ class Qwen4ExpModel(nn.Module):
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )
+        if self.config.num_experts == 0:
+            mapper = mapper | WeightsMapper(
+                orig_to_new_stacked={
+                    ".mlp.gate_proj.": (".mlp.gate_up_proj.", 0),
+                    ".mlp.up_proj.": (".mlp.gate_up_proj.", 1),
+                }
+            )
+
         # The final HC mixer only exists on the last PP rank; earlier ranks
         # must drop its checkpoint weights instead of failing to place them.
         ignore_prefixes = (

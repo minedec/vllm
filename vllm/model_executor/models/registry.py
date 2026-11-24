@@ -655,6 +655,14 @@ _MULTIMODAL_MODELS = {
         "vllm.models.qwen4_exp",
         "Qwen4ExpForConditionalGeneration",
     ),
+    "Qwen4ForConditionalGeneration": (
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
+    ),
+    "Qwen4MoeForConditionalGeneration": (
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
+    ),
     "RForConditionalGeneration": ("rvl", "RForConditionalGeneration"),
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
     "SmolVLMForConditionalGeneration": ("smolvlm", "SmolVLMForConditionalGeneration"),

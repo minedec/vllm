@@ -24,6 +24,8 @@ _NGRAM_LAYER_FIELDS = {
     "HYV4FlashVLForConditionalGeneration": "engram_layer_ids",
     "Qwen4ExpForCausalLM": "ple_layer_ids",
     "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
+    "Qwen4ForConditionalGeneration": "ple_layer_ids",
+    "Qwen4MoeForConditionalGeneration": "ple_layer_ids",
 }
 # Fields of models whose tables an Engram pool can split (`peer_group_size`).
 _PEER_GROUP_FIELDS = {"engram_layer_ids", "ple_layer_ids"}

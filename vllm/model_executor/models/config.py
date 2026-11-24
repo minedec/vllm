@@ -1987,6 +1987,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
     "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
+    "Qwen4ForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
+    "Qwen4MoeForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
     "Qwen4ExpMTP": Qwen4ExpMTPConfig,
     "ShieldGemma2ForImageClassification": (ShieldGemma2ForImageClassificationConfig),
     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,

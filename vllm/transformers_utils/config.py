@@ -424,8 +424,6 @@ class HFConfigParser(ConfigParserBase):
             # The converter changes config identifiers but preserves tensor names.
             for section in ("text", "vision"):
                 config_dict[f"{section}_config"]["model_type"] = f"qwen4_exp_{section}"
-            if model_type == "qwen4":
-                config_dict["text_config"].update(num_experts=0, ple_layer_ids=[])
             config_dict["model_type"] = "qwen4_exp"
             kwargs.setdefault("name_or_path", str(model))
             config = Qwen4ExpConfig.from_dict(config_dict, **kwargs)
